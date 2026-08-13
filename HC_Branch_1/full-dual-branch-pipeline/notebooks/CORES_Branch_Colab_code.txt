@@ -1,0 +1,452 @@
+# MD 0: # CORES Branch — Day 1 (up to Expert MLP, no gating)
+
+Implements the handcrafted branch from *Dual-Branch Gated Fusion for Open-Set Audio Deepfake Source Tracing*:
+
+1. **CORES** 66-d descriptor (Cepst
+# MD 1: ## Cell 1 — Setup
+##### CELL 2 (code)
+# Run once per Colab session
+!pip install -q librosa soundfile tqdm pyyaml
+
+import os
+import json
+import random
+from pathlib import Path
+from dataclasses import dataclass, asdict
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import librosa
+import soundfile as sf
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from tqdm.auto import tqdm
+
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print('Device:', DEVICE)
+
+# Optional: mount Google Drive for persistent caches
+USE_DRIVE = False  # set True when you have MLAAD on Drive
+if USE_DRIVE:
+    from google.colab import drive
+    drive.mount('/content/drive')
+    ROOT = Path('/content/drive/MyDrive/mlaad-cores')
+else:
+    ROOT = Path('/content/mlaad-cores')
+
+ROOT.mkdir(parents=True, exist_ok=True)
+(ROOT / 'cache').mkdir(exist_ok=True)
+(ROOT / 'checkpoints').mkdir(exist_ok=True)
+print('Working dir:', ROOT)
+# MD 3: ## Cell 2 — Config (match paper Section 2.1 & 2.2)
+##### CELL 4 (code)
+@dataclass
+class Config:
+  # Audio / features
+  sample_rate: int = 16000
+  n_fft: int = 512 # FFT window size for spectral features
+  hop_length: int = 160  # Frame hop = 10 ms at 16 kHz (16000 × 0.01)
+  n_mfcc: int = 13 # 13 MFCCs with Δ and ΔΔ derivatives (39 cepstral dims)
+  n_chroma: int = 14 # chroma features capturing pitch-class tonal structure (14 oscillatory dims)
+  cores_dim: int = 66
+
+  # Expert MLP (paper Section 2.2)
+  expert_hidden: int = 512
+  expert_out: int = 256
+  dropout: float = 0.3
+
+  # Training
+  num_classes: int = 24
+  batch_size: int = 32  # 128 if GPU RAM allows
+  lr: float = 1e-4
+  weight_decay: float = 1e-4
+  epochs: int = 50  # quick sanity run; paper uses 150 for full model
+  label_smoothing: float = 0.15
+  grad_clip: float = 5.0
+  seed: int = 42
+
+  # Paths — update when MLAAD is available
+  mlaad_root: str = str(ROOT / 'data' / 'MLAAD')
+  protocol_dir: str = str(ROOT / 'data' / 'protocol')
+  feature_cache: str = str(ROOT / 'cache' / 'cores_features.npz')
+
+
+cfg = Config()
+
+def set_seed(seed: int = 42):
+  random.seed(seed)
+  np.random.seed(seed)
+  torch.manual_seed(seed)
+  if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(seed)
+
+set_seed(cfg.seed)
+print(asdict(cfg))
+# MD 5: ## Cell 3 — CORES feature extractor
+
+| Block | Features | Dim |
+|-------|----------|-----|
+| Cepstral | 13 MFCC + Δ + ΔΔ | 39 |
+| Oscillatory | Chroma | 14 |
+| Rhythmic | ZCR | 1 |
+| Energy | RMS | 1 
+##### CELL 6 (code)
+def extract_cores(wav: np.ndarray, sr: int, cfg: Config) -> np.ndarray:
+  """Frame-level CORES features → mean-pooled 66-d utterance vector."""
+  if sr != cfg.sample_rate:
+    wav = librosa.resample(wav, orig_sr=sr, target_sr=cfg.sample_rate)
+    sr = cfg.sample_rate
+
+  # Cepstral: 13 MFCC + delta + delta-delta = 39
+  mfcc = librosa.feature.mfcc(
+      y=wav, sr=sr, n_mfcc=cfg.n_mfcc,
+      n_fft=cfg.n_fft, hop_length=cfg.hop_length)
+  mfcc_d = librosa.feature.delta(mfcc)
+  mfcc_dd = librosa.feature.delta(mfcc, order=2)
+  cepstral = np.vstack([mfcc, mfcc_d, mfcc_dd])  # (39, T)
+
+  # Oscillatory: chroma = 14
+  chroma = librosa.feature.chroma_stft(y=wav, sr=sr, n_fft=cfg.n_fft, hop_length=cfg.hop_length,n_chroma=cfg.n_chroma)  # (14, T)
+
+  # Rhythmic: ZCR = 1
+  zcr = librosa.feature.zero_crossing_rate(y=wav, frame_length=cfg.n_fft, hop_length=cfg.hop_length)  # (1, T)
+
+  # Energy: RMS = 1
+  rms = librosa.feature.rms(y=wav, frame_length=cfg.n_fft, hop_length=cfg.hop_length)  # (1, T)
+
+  # Spectral: centroid, bandwidth, rolloff, contrast(7), flatness = 11
+  centroid = librosa.feature.spectral_centroid(
+      y=wav, sr=sr, n_fft=cfg.n_fft, hop_length=cfg.hop_length)
+  bandwidth = librosa.feature.spectral_bandwidth(
+      y=wav, sr=sr, n_fft=cfg.n_fft, hop_length=cfg.hop_length)
+  rolloff = librosa.feature.spectral_rolloff(
+      y=wav, sr=sr, n_fft=cfg.n_fft, hop_length=cfg.hop_length)
+  contrast = librosa.feature.spectral_contrast(
+      y=wav, sr=sr, n_fft=cfg.n_fft, hop_length=cfg.hop_length)  # (7, T)
+  flatness = librosa.feature.spectral_flatness(
+      y=wav, n_fft=cfg.n_fft, hop_length=cfg.hop_length)  # (1, T)
+  spectral = np.vstack([centroid, bandwidth, rolloff, contrast, flatness])  # (11, T)
+
+  # Align time dimension (trim to shortest)
+  T = min(f.shape[1] for f in [cepstral, chroma, zcr, rms, spectral])
+  blocks = [cepstral[:, :T], chroma[:, :T], zcr[:, :T], rms[:, :T], spectral[:, :T]]
+  frame_feats = np.vstack(blocks).T  # (T, 66)
+
+  utterance = frame_feats.mean(axis=0)
+  assert utterance.shape[0] == cfg.cores_dim, utterance.shape
+  return utterance.astype(np.float32)
+
+
+# Quick self-test on synthetic audio
+dummy = np.random.randn(cfg.sample_rate * 2).astype(np.float32) * 0.05
+vec = extract_cores(dummy, cfg.sample_rate, cfg)
+print(f'CORES shape: {vec.shape} | mean: {vec.mean():.4f} | std: {vec.std():.4f}')
+# MD 7: ## Cell 4 — Protocol / manifest loader
+
+Two modes:
+1. **Real MLAAD** — point `protocol_dir` at the baseline repo protocol files
+2. **Demo mode** — generates a tiny fake manifest so you can test the pi
+##### CELL 8 (code)
+def load_protocol_csv(csv_path: Path) -> List[Dict]:
+  """Load a simple CSV: utt_id,wav_path,label_id,is_ood,split"""
+  rows = []
+  with open(csv_path, 'r', encoding='utf-8') as f:
+    header = f.readline().strip().split(',')
+    for line in f:
+      parts = line.strip().split(',')
+      row = dict(zip(header, parts))
+      row['label_id'] = int(row['label_id'])
+      row['is_ood'] = row['is_ood'].lower() in ('1', 'true', 'yes')
+      rows.append(row)
+  return rows
+
+
+def make_demo_manifest(cfg: Config, n_per_class: int = 8) -> Dict[str, List[Dict]]:
+  """Create tiny synthetic WAVs + manifest for pipeline testing."""
+  demo_dir = Path(cfg.mlaad_root) / 'demo_wavs'
+  demo_dir.mkdir(parents=True, exist_ok=True)
+
+  splits = {
+      'train': {'n_classes': 24, 'ood': False},
+      'dev': {'n_classes': 8, 'ood': False},
+      'dev_ood': {'n_classes': 3, 'ood': True},
+  }
+  manifest: Dict[str, List[Dict]] = {k: [] for k in ['train', 'dev', 'dev_ood']}
+
+  for split_name, spec in splits.items():
+    for c in range(spec['n_classes']):
+      for i in range(n_per_class):
+        utt_id = f"{split_name}_{c:02d}_{i:03d}"
+        wav_path = demo_dir / f"{utt_id}.wav"
+        if not wav_path.exists():
+          # class-dependent tone so classifier has something to learn
+          t = np.linspace(0, 2.0, cfg.sample_rate * 2, endpoint=False)
+          freq = 220 + c * 15 + np.random.randint(-5, 6)
+          sig = 0.2 * np.sin(2 * np.pi * freq * t)
+          sig += 0.05 * np.random.randn(len(t))
+          sf.write(wav_path, sig.astype(np.float32), cfg.sample_rate)
+        manifest[split_name if split_name != 'dev_ood' else 'dev'].append({
+            'utt_id': utt_id,
+            'wav_path': str(wav_path),
+            'label_id': -1 if spec['ood'] else c,
+            'is_ood': spec['ood'],
+            'split': 'dev' if split_name == 'dev_ood' else split_name,
+        })
+  return manifest
+
+
+def load_manifest(cfg: Config) -> Dict[str, List[Dict]]:
+  protocol_train = Path(cfg.protocol_dir) / 'train.csv'
+  if protocol_train.exists():
+    print('Loading real protocol from', cfg.protocol_dir)
+    return {
+        'train': load_protocol_csv(Path(cfg.protocol_dir) / 'train.csv'),
+        'dev': load_protocol_csv(Path(cfg.protocol_dir) / 'dev.csv'),
+        'eval': load_protocol_csv(Path(cfg.protocol_dir) / 'eval.csv'),
+    }
+  print('No protocol found — using DEMO manifest (replace with real MLAAD later)')
+  return make_demo_manifest(cfg)
+
+manifest = load_manifest(cfg)
+for k, v in manifest.items():
+  print(f"{k}: {len(v)} utterances")
+# MD 9: ## Cell 5 — Extract & cache CORES features
+##### CELL 10 (code)
+def build_feature_cache(manifest: Dict[str, List[Dict]], cfg: Config) -> Dict:
+  all_rows = []
+  for split, items in manifest.items():
+    for item in tqdm(items, desc=f'CORES {split}'):
+      wav, sr = sf.read(item['wav_path'])
+      if wav.ndim > 1:
+        wav = wav.mean(axis=1)
+      feat = extract_cores(wav.astype(np.float32), sr, cfg)
+      all_rows.append({
+          'utt_id': item['utt_id'],
+          'split': item.get('split', split),
+          'label_id': item['label_id'],
+          'is_ood': item['is_ood'],
+          'x_hc': feat,
+      })
+
+  utt_ids = np.array([r['utt_id'] for r in all_rows])
+  splits = np.array([r['split'] for r in all_rows])
+  label_ids = np.array([r['label_id'] for r in all_rows], dtype=np.int64)
+  is_ood = np.array([r['is_ood'] for r in all_rows], dtype=bool)
+  x_hc = np.stack([r['x_hc'] for r in all_rows]).astype(np.float32)
+
+  cache = {
+      'utt_ids': utt_ids,
+      'splits': splits,
+      'label_ids': label_ids,
+      'is_ood': is_ood,
+      'x_hc': x_hc,
+  }
+  np.savez_compressed(cfg.feature_cache, **cache)
+  print('Saved cache:', cfg.feature_cache, '| shape:', x_hc.shape)
+  return cache
+
+
+if Path(cfg.feature_cache).exists():
+  print('Loading existing cache:', cfg.feature_cache)
+  loaded = np.load(cfg.feature_cache, allow_pickle=True)
+  cache = {k: loaded[k] for k in loaded.files}
+  print('x_hc shape:', cache['x_hc'].shape)
+else:
+  cache = build_feature_cache(manifest, cfg)
+# MD 11: ## Cell 6 — Normalize features (train stats only)
+##### CELL 12 (code)
+def compute_norm_stats(cache: Dict) -> Tuple[np.ndarray, np.ndarray]:
+  train_mask = (cache['splits'] == 'train') & (~cache['is_ood']) & (cache['label_ids'] >= 0)
+  x_train = cache['x_hc'][train_mask]
+  mean = x_train.mean(axis=0)
+  std = x_train.std(axis=0)
+  std[std < 1e-6] = 1.0
+  return mean.astype(np.float32), std.astype(np.float32)
+
+
+feat_mean, feat_std = compute_norm_stats(cache)
+x_norm = (cache['x_hc'] - feat_mean) / feat_std
+print('Normalized x_hc — mean ~0:', x_norm.mean(), '| std ~1:', x_norm.std())
+# MD 13: ## Cell 7 — Expert MLP (paper Section 2.2)
+
+Same architecture your teammate will use for SSL, but `in_dim=66` instead of `1024`.
+##### CELL 14 (code)
+class ExpertMLP(nn.Module):
+  def __init__(self, in_dim: int, hidden_dim: int = 512, out_dim: int = 256, dropout: float = 0.3):
+    super().__init__()
+    self.net = nn.Sequential(
+        nn.Linear(in_dim, hidden_dim),
+        nn.BatchNorm1d(hidden_dim),
+        nn.ReLU(inplace=True),
+        nn.Dropout(dropout),
+        nn.Linear(hidden_dim, out_dim),
+        nn.BatchNorm1d(out_dim),
+        nn.ReLU(inplace=True),
+        nn.Dropout(dropout),
+    )
+
+  def forward(self, x: torch.Tensor) -> torch.Tensor:
+    return self.net(x)
+
+
+class HCOnlyModel(nn.Module):
+  """CORES expert + linear classifier. No gating yet."""
+  def __init__(self, cfg: Config):
+    super().__init__()
+    self.expert = ExpertMLP(cfg.cores_dim, cfg.expert_hidden, cfg.expert_out, cfg.dropout)
+    self.classifier = nn.Linear(cfg.expert_out, cfg.num_classes)
+
+  def forward(self, x_hc: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    e_hc = self.expert(x_hc)
+    logits = self.classifier(e_hc)
+    return e_hc, logits
+
+
+model = HCOnlyModel(cfg).to(DEVICE)
+n_params = sum(p.numel() for p in model.parameters())
+print(f'HC-only model params: {n_params:,}')
+
+# shape check
+with torch.no_grad():
+  dummy_x = torch.randn(4, cfg.cores_dim, device=DEVICE)
+  e, logits = model(dummy_x)
+  print('e_hc:', e.shape, '| logits:', logits.shape)
+# MD 15: ## Cell 8 — Dataset & DataLoader
+##### CELL 16 (code)
+class CORESDataset(Dataset):
+  def __init__(self, x: np.ndarray, y: np.ndarray):
+    self.x = torch.from_numpy(x).float()
+    self.y = torch.from_numpy(y).long()
+
+  def __len__(self):
+    return len(self.x)
+
+  def __getitem__(self, idx):
+    return self.x[idx], self.y[idx]
+
+
+def split_arrays(cache, x_norm, split_name: str, id_only: bool = True):
+  mask = cache['splits'] == split_name
+  if id_only:
+    mask &= (~cache['is_ood']) & (cache['label_ids'] >= 0)
+  return x_norm[mask], cache['label_ids'][mask]
+
+
+x_train, y_train = split_arrays(cache, x_norm, 'train')
+x_dev, y_dev = split_arrays(cache, x_norm, 'dev')
+
+train_loader = DataLoader(CORESDataset(x_train, y_train), batch_size=cfg.batch_size, shuffle=True, drop_last=False)
+dev_loader = DataLoader(CORESDataset(x_dev, y_dev), batch_size=cfg.batch_size, shuffle=False)
+print('Train:', len(x_train), '| Dev ID:', len(x_dev))
+# MD 17: ## Cell 9 — Train HC-only baseline
+##### CELL 18 (code)
+def label_smoothed_nll_loss(logits, targets, num_classes, smoothing=0.15):
+  log_probs = F.log_softmax(logits, dim=-1)
+  with torch.no_grad():
+    true_dist = torch.zeros_like(log_probs)
+    true_dist.fill_(smoothing / (num_classes - 1))
+    true_dist.scatter_(1, targets.unsqueeze(1), 1.0 - smoothing)
+  return torch.mean(torch.sum(-true_dist * log_probs, dim=-1))
+
+
+@torch.no_grad()
+def accuracy(logits, targets):
+  preds = logits.argmax(dim=-1)
+  return (preds == targets).float().mean().item()
+
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs, eta_min=5e-6)
+
+best_dev_acc = 0.0
+history = []
+
+for epoch in range(1, cfg.epochs + 1):
+  model.train()
+  train_loss = 0.0
+  train_acc = 0.0
+  n_batches = 0
+  for xb, yb in train_loader:
+    xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+    optimizer.zero_grad()
+    _, logits = model(xb)
+    loss = label_smoothed_nll_loss(logits, yb, cfg.num_classes, cfg.label_smoothing)
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+    optimizer.step()
+    train_loss += loss.item()
+    train_acc += accuracy(logits, yb)
+    n_batches += 1
+  scheduler.step()
+
+  model.eval()
+  dev_loss = 0.0
+  dev_acc = 0.0
+  n_dev = 0
+  for xb, yb in dev_loader:
+    xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+    _, logits = model(xb)
+    loss = label_smoothed_nll_loss(logits, yb, cfg.num_classes, cfg.label_smoothing)
+    dev_loss += loss.item()
+    dev_acc += accuracy(logits, yb)
+    n_dev += 1
+
+  train_loss /= max(n_batches, 1)
+  train_acc /= max(n_batches, 1)
+  dev_loss /= max(n_dev, 1)
+  dev_acc /= max(n_dev, 1)
+  history.append({'epoch': epoch, 'train_loss': train_loss, 'train_acc': train_acc, 'dev_acc': dev_acc})
+
+  if dev_acc > best_dev_acc:
+    best_dev_acc = dev_acc
+    ckpt_path = Path(cfg.feature_cache).parent.parent / 'checkpoints' / 'hc_only_best.pt'
+    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({
+        'model': model.state_dict(),
+        'cfg': asdict(cfg),
+        'feat_mean': feat_mean,
+        'feat_std': feat_std,
+        'epoch': epoch,
+        'dev_acc': dev_acc,
+    }, ckpt_path)
+
+  if epoch % 5 == 0 or epoch == 1 or epoch == cfg.epochs:
+    print(f"Epoch {epoch:03d} | train loss {train_loss:.4f} acc {train_acc:.3f} | dev acc {dev_acc:.3f}")
+
+print(f'Best dev accuracy: {best_dev_acc:.3f}')
+# MD 19: ## Cell 10 — Export artifacts for teammate / future gating
+
+Saves:
+- `cores_features.npz` — cached 66-d vectors + metadata
+- `hc_only_best.pt` — expert weights + normalization stats
+- `norm_stats.npz`
+##### CELL 20 (code)
+norm_path = Path(cfg.feature_cache).parent / 'norm_stats.npz'
+np.savez_compressed(norm_path, feat_mean=feat_mean, feat_std=feat_std)
+
+export_meta = {
+    'feature_dim': cfg.cores_dim,
+    'expert_out_dim': cfg.expert_out,
+    'num_utterances': int(cache['x_hc'].shape[0]),
+    'cache_path': cfg.feature_cache,
+    'checkpoint': str(Path(cfg.feature_cache).parent.parent / 'checkpoints' / 'hc_only_best.pt'),
+    'utt_id_format': 'string stable id per utterance',
+    'notes': 'Teammate should produce x_ssl (1024,) with same utt_id keys for fusion later.',
+}
+meta_path = Path(cfg.feature_cache).parent / 'cores_export_meta.json'
+with open(meta_path, 'w', encoding='utf-8') as f:
+  json.dump(export_meta, f, indent=2)
+
+print('Exported:')
+print(' -', cfg.feature_cache)
+print(' -', norm_path)
+print(' -', meta_path)
+print(json.dumps(export_meta, indent=2))
+# MD 21: ---
+
+## When MLAAD arrives — swap demo for real data
+
+1. Download MLAAD via [baseline repo](https://github.com/piotrkawa/audio-deepfake-source-tracing) `scripts/download_resources.py`
+2. Put protocol 

@@ -1,0 +1,281 @@
+# MD 0: # Eval OOD — Dual-Branch Gated Fusion
+
+Loads `dual_branch_best.pt` + feature caches.
+Reports **ID Acc**, **FPR95**, **EERc**, AUROC, OOD-EER for Energy / SME / MSP.
+Primary scorer: **SME** (paper).
+
+S
+# MD 1: ## Cell 1 — Setup
+##### CELL 2 (code)
+from pathlib import Path
+from dataclasses import dataclass
+from typing import Dict, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print('Device:', DEVICE)
+
+USE_DRIVE = False
+if USE_DRIVE:
+    from google.colab import drive
+    drive.mount('/content/drive')
+    ROOT = Path('/content/drive/MyDrive/mlaad-dual-branch')
+else:
+    ROOT = Path('/content/mlaad-dual-branch')
+
+CKPT = ROOT / 'checkpoints' / 'dual_branch_best.pt'
+CORES_CACHE = ROOT / 'cache' / 'cores_features.npz'
+XLSR_CACHE = ROOT / 'cache' / 'xlsr_features.npz'
+print('ROOT', ROOT)
+# MD 3: ## Cell 2 — Model defs (must match train notebook)
+##### CELL 4 (code)
+class ExpertMLP(nn.Module):
+  def __init__(self, in_dim, hidden=512, out=256, dropout=0.3):
+    super().__init__()
+    self.net = nn.Sequential(
+        nn.Linear(in_dim, hidden), nn.BatchNorm1d(hidden), nn.ReLU(inplace=True), nn.Dropout(dropout),
+        nn.Linear(hidden, out), nn.BatchNorm1d(out), nn.ReLU(inplace=True), nn.Dropout(dropout),
+    )
+  def forward(self, x):
+    return self.net(x)
+
+
+class GatingNetwork(nn.Module):
+  def __init__(self, in_dim=512, hidden=128, dropout=0.2):
+    super().__init__()
+    self.net = nn.Sequential(
+        nn.Linear(in_dim, hidden), nn.ReLU(inplace=True), nn.Dropout(dropout), nn.Linear(hidden, 2))
+  def forward(self, e_hc, e_ssl):
+    return torch.softmax(self.net(torch.cat([e_hc, e_ssl], dim=-1)), dim=-1)
+
+
+class DualBranchModel(nn.Module):
+  def __init__(self, cores_dim=66, ssl_dim=1024, hidden=512, out=256,
+               gate_hidden=128, num_classes=24, drop_e=0.3, drop_g=0.2):
+    super().__init__()
+    self.expert_hc = ExpertMLP(cores_dim, hidden, out, drop_e)
+    self.expert_ssl = ExpertMLP(ssl_dim, hidden, out, drop_e)
+    self.gate = GatingNetwork(out * 2, gate_hidden, drop_g)
+    self.classifier = nn.Linear(out, num_classes)
+
+  def forward(self, x_hc, x_ssl):
+    e_hc = self.expert_hc(x_hc)
+    e_ssl = self.expert_ssl(x_ssl)
+    alpha = self.gate(e_hc, e_ssl)
+    e_fused = alpha[:, 0:1] * e_hc + alpha[:, 1:2] * e_ssl
+    return self.classifier(e_fused), alpha
+# MD 5: ## Cell 3 — Load checkpoint + joined caches
+##### CELL 6 (code)
+def load_npz(path):
+  z = np.load(path, allow_pickle=True)
+  return {k: z[k] for k in z.files}
+
+
+def join_caches(cores, ssl):
+  ssl_map = {uid: i for i, uid in enumerate(ssl['utt_ids'].tolist())}
+  ic, is_ = [], []
+  for i, uid in enumerate(cores['utt_ids'].tolist()):
+    if uid in ssl_map:
+      ic.append(i); is_.append(ssl_map[uid])
+  ic, is_ = np.asarray(ic), np.asarray(is_)
+  return {
+      'utt_ids': cores['utt_ids'][ic],
+      'splits': cores['splits'][ic],
+      'label_ids': cores['label_ids'][ic],
+      'is_ood': cores['is_ood'][ic],
+      'x_hc': cores['x_hc'][ic].astype(np.float32),
+      'x_ssl': ssl['x_ssl'][is_].astype(np.float32),
+  }
+
+
+ckpt = torch.load(CKPT, map_location=DEVICE)
+c = ckpt['cfg']
+model = DualBranchModel(
+    cores_dim=c.get('cores_dim', 66),
+    ssl_dim=c.get('ssl_dim', 1024),
+    hidden=c.get('expert_hidden', 512),
+    out=c.get('expert_out', 256),
+    gate_hidden=c.get('gate_hidden', 128),
+    num_classes=c.get('num_classes', 24),
+).to(DEVICE)
+model.load_state_dict(ckpt['model'])
+model.eval()
+print('Loaded ckpt epoch', ckpt.get('epoch'), 'metrics', ckpt.get('metrics'))
+
+cores = load_npz(CORES_CACHE)
+if XLSR_CACHE.exists():
+  ssl = load_npz(XLSR_CACHE)
+else:
+  raise FileNotFoundError('Need real or stub xlsr_features.npz for eval')
+
+data = join_caches(cores, ssl)
+hc_mean, hc_std = ckpt['hc_mean'], ckpt['hc_std']
+ssl_mean, ssl_std = ckpt['ssl_mean'], ckpt['ssl_std']
+x_hc = (data['x_hc'] - hc_mean) / hc_std
+x_ssl = (data['x_ssl'] - ssl_mean) / ssl_std
+print('Joined', len(data['utt_ids']), 'utterances')
+# MD 7: ## Cell 4 — Forward pass collect logits
+##### CELL 8 (code)
+@torch.no_grad()
+def collect(split_name: str):
+  m = data['splits'] == split_name
+  if not m.any():
+    return None
+  loader = DataLoader(
+      TensorDataset(
+          torch.from_numpy(x_hc[m]).float(),
+          torch.from_numpy(x_ssl[m]).float(),
+          torch.from_numpy(data['label_ids'][m]).long(),
+          torch.from_numpy(data['is_ood'][m].astype(np.bool_)),
+      ),
+      batch_size=128, shuffle=False)
+  logits_l, y_l, ood_l, a_l = [], [], [], []
+  for xh, xs, y, ood in loader:
+    logits, alpha = model(xh.to(DEVICE), xs.to(DEVICE))
+    logits_l.append(logits.cpu()); y_l.append(y); ood_l.append(ood); a_l.append(alpha.cpu())
+  return {
+      'logits': torch.cat(logits_l),
+      'y': torch.cat(y_l),
+      'ood': torch.cat(ood_l).bool(),
+      'alpha': torch.cat(a_l),
+  }
+
+dev = collect('dev')
+ev = collect('eval') if (data['splits'] == 'eval').any() else None
+print('dev:', None if dev is None else len(dev['y']), '| eval:', None if ev is None else len(ev['y']))
+# MD 9: ## Cell 5 — Scorers + metrics
+##### CELL 10 (code)
+def score_energy(logits):
+  return (-torch.logsumexp(logits, dim=-1)).numpy()
+
+
+def score_sme(logits):
+  probs = torch.softmax(logits, dim=-1)
+  return (-torch.logsumexp(torch.log(probs.clamp_min(1e-12)), dim=-1)).numpy()
+
+
+def score_msp(logits):
+  # negative max softmax prob → lower is more ID-like (consistent with energy)
+  probs = torch.softmax(logits, dim=-1)
+  return (-probs.max(dim=-1).values).numpy()
+
+
+def auroc(id_scores, ood_scores):
+  # higher score = more OOD for standard AUROC; our scores are lower for ID
+  # flip: use -score so higher means more ID, then AUROC for OOD detection with labels
+  y = np.concatenate([np.zeros(len(id_scores)), np.ones(len(ood_scores))])
+  s = np.concatenate([-id_scores, -ood_scores])  # higher => more OOD after flip of lower-is-ID
+  # actually: id_scores low, ood high ideally. For AUROC treat score as OOD-ness directly:
+  y = np.concatenate([np.zeros(len(id_scores)), np.ones(len(ood_scores))])
+  s = np.concatenate([id_scores, ood_scores])  # higher score = more OOD
+  order = np.argsort(s)
+  y_sorted = y[order]
+  # Mann-Whitney style
+  n_pos = y.sum(); n_neg = len(y) - n_pos
+  if n_pos == 0 or n_neg == 0:
+    return float('nan')
+  ranks = np.empty(len(y))
+  ranks[order] = np.arange(1, len(y) + 1)
+  sum_pos = ranks[y == 1].sum()
+  return float((sum_pos - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg))
+
+
+def eer(id_scores, ood_scores):
+  scores = np.concatenate([id_scores, ood_scores])
+  labels = np.concatenate([np.zeros(len(id_scores)), np.ones(len(ood_scores))])  # 1=OOD
+  thresholds = np.unique(scores)
+  best = 1.0
+  for thr in thresholds:
+    # predict OOD if score > thr (assuming OOD has higher energy-like scores)
+    pred = scores > thr
+    fpr = ((pred == 1) & (labels == 0)).sum() / max((labels == 0).sum(), 1)
+    fnr = ((pred == 0) & (labels == 1)).sum() / max((labels == 1).sum(), 1)
+    best = min(best, abs(fpr - fnr))
+    if abs(fpr - fnr) < 1e-4:
+      return float((fpr + fnr) / 2)
+  # approximate: find thr minimizing |fpr-fnr|
+  best_val = 1.0
+  for thr in thresholds:
+    pred = scores > thr
+    fpr = ((pred == 1) & (labels == 0)).sum() / max((labels == 0).sum(), 1)
+    fnr = ((pred == 0) & (labels == 1)).sum() / max((labels == 1).sum(), 1)
+    if abs(fpr - fnr) < best:
+      best = abs(fpr - fnr)
+      best_val = (fpr + fnr) / 2
+  return float(best_val)
+
+
+def fpr95(id_scores, ood_scores):
+  thr = np.percentile(id_scores, 95)  # accept ID if score <= thr
+  return float((ood_scores <= thr).mean()), float(thr)
+
+
+def evaluate_split(pack, thr=None):
+  logits, y, ood = pack['logits'], pack['y'], pack['ood']
+  id_mask = (~ood) & (y >= 0)
+  id_acc = (logits[id_mask].argmax(-1) == y[id_mask]).float().mean().item() if id_mask.any() else float('nan')
+
+  results = {}
+  for name, fn in [('Energy', score_energy), ('SME', score_sme), ('MSP', score_msp)]:
+    scores = fn(logits)
+    id_s = scores[id_mask.numpy()]
+    ood_s = scores[ood.numpy()]
+    if thr is None:
+      fpr, t = fpr95(id_s, ood_s)
+    else:
+      t = thr[name]
+      fpr = float((ood_s <= t).mean())
+    # EERc approx: ID wrong-or-rejected rate averaged with OOD accept rate
+    accepted = scores <= (t if thr is not None else np.percentile(id_s, 95))
+    correct = (logits.argmax(-1) == y).numpy() & id_mask.numpy()
+    id_ok = correct & accepted[id_mask.numpy()] if False else (correct & (scores[id_mask.numpy()] <= (t if thr else np.percentile(id_s, 95))))
+    # cleaner:
+    thr_use = t if thr is not None else np.percentile(id_s, 95)
+    id_accepted = scores[id_mask.numpy()] <= thr_use
+    id_correct = (logits[id_mask].argmax(-1) == y[id_mask]).numpy()
+    id_joint_err = 1.0 - float((id_correct & id_accepted).mean()) if len(id_s) else 1.0
+    ood_accept = float((ood_s <= thr_use).mean()) if len(ood_s) else 0.0
+    eerc = 0.5 * (id_joint_err + ood_accept)
+
+    results[name] = {
+        'ID_Acc': id_acc,
+        'FPR95': fpr,
+        'EERc': eerc,
+        'AUROC': auroc(id_s, ood_s),
+        'OOD_EER': eer(id_s, ood_s),
+        'thr': float(thr_use),
+    }
+  alpha_id = pack['alpha'][id_mask].mean(0).tolist() if id_mask.any() else [None, None]
+  alpha_ood = pack['alpha'][ood].mean(0).tolist() if ood.any() else [None, None]
+  results['gate'] = {'alpha_id': alpha_id, 'alpha_ood': alpha_ood}
+  return results
+
+
+dev_metrics = evaluate_split(dev)
+print('=== DEV ===')
+for k, v in dev_metrics.items():
+  print(k, v)
+
+thresholds = {name: dev_metrics[name]['thr'] for name in ['Energy', 'SME', 'MSP']}
+
+if ev is not None:
+  eval_metrics = evaluate_split(ev, thr=thresholds)
+  print('=== EVAL (thresholds from Dev) ===')
+  for k, v in eval_metrics.items():
+    print(k, v)
+else:
+  print('No eval split in cache — report Dev metrics for now.')
+# MD 11: ## Cell 6 — What to paste back to the team
+
+Copy **SME** Eval row (or Dev if Eval missing):
+- ID Acc
+- FPR95
+- EERc
+- AUROC / OOD-EER
+- Gate `α_ssl` ID vs OOD
+
+Paper ballpark: ID Acc ~97.6%, EERc ~4.9

@@ -1,0 +1,12 @@
+HC_Branch_1/full-dual-branch-pipeline/cache/xlsr_features.npz
+.venv/
+__pycache__/
+*.pyc
+.venv/
+__pycache__/
+*.pyc
+HC_Branch_1/full-dual-branch-pipeline/cache/cores_tmp/
+ssl_branch_1/all_audios/
+HC_Branch_1/full-dual-branch-pipeline/cache/
+newww/audio-deepfake-source-tracing/data/
+.git_backup/

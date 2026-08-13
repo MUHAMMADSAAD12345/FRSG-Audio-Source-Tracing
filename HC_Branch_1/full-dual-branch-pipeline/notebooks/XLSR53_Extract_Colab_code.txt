@@ -1,0 +1,219 @@
+# MD 0: # XLSR-53 Feature Extraction (Teammate GPU Job)
+
+Frozen `facebook/wav2vec2-large-xlsr-53` → mean-pool last hidden states → **1024-d** `x_ssl`.
+
+Output: `cache/xlsr_features.npz` with the **same** `utt
+# MD 1: ## Cell 1 — Setup
+##### CELL 2 (code)
+!pip install -q transformers soundfile tqdm
+
+import json
+import random
+from pathlib import Path
+from dataclasses import dataclass, asdict
+from typing import Dict, List
+
+import numpy as np
+import soundfile as sf
+import torch
+from tqdm.auto import tqdm
+
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print('Device:', DEVICE)
+
+USE_DRIVE = False  # set True on Colab with Drive
+if USE_DRIVE:
+    from google.colab import drive
+    drive.mount('/content/drive')
+    ROOT = Path('/content/drive/MyDrive/mlaad-dual-branch')
+else:
+    ROOT = Path('/content/mlaad-dual-branch')
+
+ROOT.mkdir(parents=True, exist_ok=True)
+(ROOT / 'cache').mkdir(exist_ok=True)
+print('Working dir:', ROOT)
+# MD 3: ## Cell 2 — Config
+##### CELL 4 (code)
+@dataclass
+class Config:
+  sample_rate: int = 16000
+  ssl_dim: int = 1024
+  model_name: str = 'facebook/wav2vec2-large-xlsr-53'
+  max_seconds: float = 10.0  # truncate long clips for memory
+  batch_size: int = 1  # wav2vec2 variable length; keep 1 unless padded
+  seed: int = 42
+  mlaad_root: str = str(ROOT / 'data' / 'MLAAD')
+  protocol_dir: str = str(ROOT / 'data' / 'protocol')
+  feature_cache: str = str(ROOT / 'cache' / 'xlsr_features.npz')
+  cores_cache: str = str(ROOT / 'cache' / 'cores_features.npz')
+
+cfg = Config()
+random.seed(cfg.seed)
+np.random.seed(cfg.seed)
+torch.manual_seed(cfg.seed)
+print(asdict(cfg))
+# MD 5: ## Cell 3 — Protocol / manifest loader
+
+Same CSV schema as CORES. Falls back to **demo** if protocol missing.
+##### CELL 6 (code)
+def load_protocol_csv(csv_path: Path) -> List[Dict]:
+  rows = []
+  with open(csv_path, 'r', encoding='utf-8') as f:
+    header = f.readline().strip().split(',')
+    for line in f:
+      parts = line.strip().split(',')
+      row = dict(zip(header, parts))
+      row['label_id'] = int(row['label_id'])
+      row['is_ood'] = str(row['is_ood']).lower() in ('1', 'true', 'yes')
+      rows.append(row)
+  return rows
+
+
+def make_demo_manifest(cfg: Config, n_per_class: int = 4) -> Dict[str, List[Dict]]:
+  """Tiny synthetic WAVs so extract pipeline can be smoke-tested."""
+  demo_dir = Path(cfg.mlaad_root) / 'demo_wavs'
+  demo_dir.mkdir(parents=True, exist_ok=True)
+  manifest: Dict[str, List[Dict]] = {'train': [], 'dev': []}
+  for split_name, n_classes, ood in [('train', 24, False), ('dev', 8, False), ('dev_ood', 3, True)]:
+    target = 'dev' if split_name == 'dev_ood' else split_name
+    for c in range(n_classes):
+      for i in range(n_per_class):
+        utt_id = f"{split_name}_{c:02d}_{i:03d}"
+        wav_path = demo_dir / f"{utt_id}.wav"
+        if not wav_path.exists():
+          t = np.linspace(0, 1.0, cfg.sample_rate, endpoint=False)
+          freq = 220 + c * 15
+          sig = 0.2 * np.sin(2 * np.pi * freq * t) + 0.05 * np.random.randn(len(t))
+          sf.write(wav_path, sig.astype(np.float32), cfg.sample_rate)
+        manifest[target].append({
+            'utt_id': utt_id,
+            'wav_path': str(wav_path),
+            'label_id': -1 if ood else c,
+            'is_ood': ood,
+            'split': target,
+        })
+  return manifest
+
+
+def load_manifest(cfg: Config) -> Dict[str, List[Dict]]:
+  protocol_train = Path(cfg.protocol_dir) / 'train.csv'
+  if protocol_train.exists():
+    print('Loading real protocol from', cfg.protocol_dir)
+    out = {
+        'train': load_protocol_csv(Path(cfg.protocol_dir) / 'train.csv'),
+        'dev': load_protocol_csv(Path(cfg.protocol_dir) / 'dev.csv'),
+    }
+    eval_csv = Path(cfg.protocol_dir) / 'eval.csv'
+    if eval_csv.exists():
+      out['eval'] = load_protocol_csv(eval_csv)
+    return out
+  print('No protocol found — DEMO manifest (replace with real MLAAD at uni)')
+  return make_demo_manifest(cfg)
+
+manifest = load_manifest(cfg)
+for k, v in manifest.items():
+  print(f'{k}: {len(v)} utterances')
+# MD 7: ## Cell 4 — Load frozen XLSR-53
+##### CELL 8 (code)
+from transformers import Wav2Vec2Model, Wav2Vec2Processor
+
+processor = Wav2Vec2Processor.from_pretrained(cfg.model_name)
+model = Wav2Vec2Model.from_pretrained(cfg.model_name).to(DEVICE)
+model.eval()
+for p in model.parameters():
+  p.requires_grad = False
+print('XLSR-53 loaded and frozen. Hidden size:', model.config.hidden_size)
+assert model.config.hidden_size == cfg.ssl_dim
+# MD 9: ## Cell 5 — Extract one utterance → 1024-d
+##### CELL 10 (code)
+@torch.no_grad()
+def extract_xlsr(wav: np.ndarray, sr: int, cfg: Config) -> np.ndarray:
+  if wav.ndim > 1:
+    wav = wav.mean(axis=1)
+  wav = wav.astype(np.float32)
+  if sr != cfg.sample_rate:
+    # simple resample via numpy linspace (prefer librosa/torchaudio at uni if available)
+    import torchaudio
+    wav_t = torch.from_numpy(wav).unsqueeze(0)
+    wav_t = torchaudio.functional.resample(wav_t, sr, cfg.sample_rate)
+    wav = wav_t.squeeze(0).numpy()
+    sr = cfg.sample_rate
+
+  max_len = int(cfg.max_seconds * cfg.sample_rate)
+  if len(wav) > max_len:
+    wav = wav[:max_len]
+
+  inputs = processor(wav, sampling_rate=sr, return_tensors='pt', padding=True)
+  input_values = inputs.input_values.to(DEVICE)
+  outputs = model(input_values)
+  hidden = outputs.last_hidden_state  # (1, T, 1024)
+  pooled = hidden.mean(dim=1).squeeze(0).cpu().numpy().astype(np.float32)
+  assert pooled.shape == (cfg.ssl_dim,), pooled.shape
+  return pooled
+
+# Self-test
+dummy = np.random.randn(cfg.sample_rate).astype(np.float32) * 0.05
+vec = extract_xlsr(dummy, cfg.sample_rate, cfg)
+print('XLSR shape:', vec.shape, '| mean:', float(vec.mean()), '| std:', float(vec.std()))
+# MD 11: ## Cell 6 — Extract all + save cache
+##### CELL 12 (code)
+def build_feature_cache(manifest: Dict[str, List[Dict]], cfg: Config) -> Dict:
+  all_rows = []
+  for split, items in manifest.items():
+    for item in tqdm(items, desc=f'XLSR {split}'):
+      wav, sr = sf.read(item['wav_path'])
+      feat = extract_xlsr(np.asarray(wav), sr, cfg)
+      all_rows.append({
+          'utt_id': item['utt_id'],
+          'split': item.get('split', split),
+          'label_id': item['label_id'],
+          'is_ood': item['is_ood'],
+          'x_ssl': feat,
+      })
+
+  cache = {
+      'utt_ids': np.array([r['utt_id'] for r in all_rows]),
+      'splits': np.array([r['split'] for r in all_rows]),
+      'label_ids': np.array([r['label_id'] for r in all_rows], dtype=np.int64),
+      'is_ood': np.array([r['is_ood'] for r in all_rows], dtype=bool),
+      'x_ssl': np.stack([r['x_ssl'] for r in all_rows]).astype(np.float32),
+  }
+  np.savez_compressed(cfg.feature_cache, **cache)
+  print('Saved:', cfg.feature_cache, '| shape:', cache['x_ssl'].shape)
+  return cache
+
+
+if Path(cfg.feature_cache).exists():
+  print('Loading existing cache:', cfg.feature_cache)
+  loaded = np.load(cfg.feature_cache, allow_pickle=True)
+  cache = {k: loaded[k] for k in loaded.files}
+  print('x_ssl shape:', cache['x_ssl'].shape)
+else:
+  cache = build_feature_cache(manifest, cfg)
+# MD 13: ## Cell 7 — Overlap check vs CORES cache
+##### CELL 14 (code)
+cores_path = Path(cfg.cores_cache)
+if cores_path.exists():
+  cores = np.load(cores_path, allow_pickle=True)
+  cores_ids = set(cores['utt_ids'].tolist())
+  ssl_ids = set(cache['utt_ids'].tolist())
+  overlap = cores_ids & ssl_ids
+  print(f'CORES utts: {len(cores_ids)} | XLSR utts: {len(ssl_ids)} | overlap: {len(overlap)}')
+  if len(overlap) < min(len(cores_ids), len(ssl_ids)):
+    print('WARNING: incomplete overlap — training will keep intersection only')
+  else:
+    print('OK: full overlap with CORES cache')
+else:
+  print('CORES cache not found yet at', cores_path)
+  print('Run CORES notebook first (or in parallel), then re-run this cell.')
+
+meta = {
+    'feature_dim': cfg.ssl_dim,
+    'model_name': cfg.model_name,
+    'num_utterances': int(cache['x_ssl'].shape[0]),
+    'cache_path': cfg.feature_cache,
+}
+meta_path = Path(cfg.feature_cache).parent / 'xlsr_export_meta.json'
+with open(meta_path, 'w', encoding='utf-8') as f:
+  json.dump(meta, f, indent=2)
+print('Wrote', meta_path)
